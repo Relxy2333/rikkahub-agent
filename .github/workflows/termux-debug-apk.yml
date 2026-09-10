@@ -1,0 +1,176 @@
+name: Termux fix - Debug APK
+run-name: Termux Debug APK - ${{ inputs.source_ref }}
+
+# Manual only: committing this file does not start a build.
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Branch, tag, or commit to test and build
+        required: true
+        type: string
+        default: fix/termux-result-newline-20260910
+
+permissions:
+  contents: read
+
+concurrency:
+  group: termux-debug-${{ github.workflow }}-${{ inputs.source_ref }}
+  cancel-in-progress: false
+
+env:
+  JAVA_VERSION: '17'
+  NODE_VERSION: '24'
+  BUN_VERSION: '1.4.2'
+  PNPM_VERSION: '12.3.4'
+  ANDROID_API: '37'
+  ANDROID_BUILD_TOOLS: '36.0.0'
+  ANDROID_NDK: '28.2.13676358'
+  ANDROID_CMAKE: '3.22.1'
+  CMAKE_BUILD_PARALLEL_LEVEL: '2'
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  debug-apk:
+    name: Test Termux and build Debug APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out source and native submodules
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_ref }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Record exact source revision
+        id: source
+        run: |
+          mkdir -p ci-artifacts/logs
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+          git show -s --format=fuller HEAD > ci-artifacts/logs/source.txt
+          git submodule status --recursive >> ci-artifacts/logs/source.txt
+          test -f llama-cpp/native/llama.cpp/CMakeLists.txt
+
+      - name: Set up JDK
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+
+      - name: Set up pnpm for the Web UI build
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          package_json_file: web-ui/package.json
+          run_install: false
+
+      - name: Set up Bun for locked Web UI dependencies
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Set up Android SDK and native build tools
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          log-accepted-android-sdk-licenses: false
+          packages: >-
+            platform-tools
+            platforms;android-${{ env.ANDROID_API }}
+            build-tools;${{ env.ANDROID_BUILD_TOOLS }}
+            ndk;${{ env.ANDROID_NDK }}
+            cmake;${{ env.ANDROID_CMAKE }}
+
+      - name: Set up Gradle cache and validate the wrapper
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+        with:
+          cache-read-only: false
+
+      - name: Record build environment
+        run: |
+          {
+            java -version
+            node --version
+            pnpm --version
+            bun --version
+            df -h .
+          } > ci-artifacts/logs/environment.txt 2>&1
+
+      # :web:preBuild installs with Bun and builds with pnpm automatically.
+      # Limit workers and keep Kotlin in-process to fit the hosted runner.
+      - name: Run Termux regression tests
+        id: tests
+        run: |
+          bash ./gradlew --no-daemon --no-configuration-cache --no-parallel \
+            --max-workers=2 --stacktrace --console=plain \
+            -Pkotlin.compiler.execution.strategy=in-process \
+            :app:testDebugUnitTest \
+            --tests 'me.rerere.rikkahub.data.ai.tools.local.TermuxToolTest' \
+            2>&1 | tee ci-artifacts/logs/termux-tests.log
+
+      - name: Build Debug APKs after tests pass
+        id: build
+        run: |
+          bash ./gradlew --no-daemon --no-configuration-cache --no-parallel \
+            --max-workers=2 --stacktrace --console=plain \
+            -Pkotlin.compiler.execution.strategy=in-process \
+            :app:assembleDebug \
+            2>&1 | tee ci-artifacts/logs/assemble-debug.log
+
+      - name: Verify APK signatures and prepare downloads
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          shopt -s nullglob
+          apks=(app/build/outputs/apk/debug/*.apk)
+          if (( ${#apks[@]} == 0 )); then
+            echo '::error::assembleDebug did not produce any APKs'
+            exit 1
+          fi
+          mkdir -p ci-artifacts/apk
+          for apk in "${apks[@]}"; do
+            "$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS/apksigner" verify \
+              --verbose --print-certs "$apk" \
+              2>&1 | tee -a ci-artifacts/logs/apk-signatures.log
+            cp "$apk" ci-artifacts/apk/
+          done
+          {
+            echo "Source commit: $SOURCE_SHA"
+            echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo 'Variant: debug'
+            echo 'Application ID: excp.rikkahub.debug'
+            echo 'Signing: generated Android debug key, not the upstream release key'
+          } > ci-artifacts/apk/build-info.txt
+          cd ci-artifacts/apk
+          sha256sum ./*.apk > SHA256SUMS
+
+      - name: Upload Debug APKs and SHA-256 checksums
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rikkahub-termux-debug-${{ steps.source.outputs.short_sha }}-${{ github.run_number }}-${{ github.run_attempt }}
+          path: ci-artifacts/apk/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Upload test reports and build logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: termux-build-diagnostics-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            ci-artifacts/logs/
+            app/build/reports/tests/testDebugUnitTest/
+            app/build/test-results/testDebugUnitTest/
+          if-no-files-found: warn
+          retention-days: 14
