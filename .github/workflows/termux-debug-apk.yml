@@ -23,7 +23,8 @@ env:
   NODE_VERSION: '24'
   BUN_VERSION: '1.4.2'
   PNPM_VERSION: '12.3.4'
-  ANDROID_API: '37'
+  # SDK Manager uses the minor-versioned package name for API 37.
+  ANDROID_PLATFORM: '37.0'
   ANDROID_BUILD_TOOLS: '36.0.0'
   ANDROID_NDK: '28.2.13676358'
   ANDROID_CMAKE: '3.22.1'
@@ -86,7 +87,7 @@ jobs:
           log-accepted-android-sdk-licenses: false
           packages: >-
             platform-tools
-            platforms;android-${{ env.ANDROID_API }}
+            platforms;android-${{ env.ANDROID_PLATFORM }}
             build-tools;${{ env.ANDROID_BUILD_TOOLS }}
             ndk;${{ env.ANDROID_NDK }}
             cmake;${{ env.ANDROID_CMAKE }}
@@ -98,7 +99,9 @@ jobs:
 
       - name: Record build environment
         run: |
+          test -f "$ANDROID_HOME/platforms/android-$ANDROID_PLATFORM/android.jar"
           {
+            cat "$ANDROID_HOME/platforms/android-$ANDROID_PLATFORM/source.properties"
             java -version
             node --version
             pnpm --version
